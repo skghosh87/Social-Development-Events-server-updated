@@ -26,9 +26,62 @@ async function run() {
   try {
     // await client.connect();
 
-    const database = client.db("socialdevelopment");
+    const database = client.db("socialdevelopmentevent");
     const eventsCollection = database.collection("events");
     const joinedEventsCollection = database.collection("joinedEvents");
+    const usersCollection = database.collection("users");
+    // User  Api
+    // ১. ইউজার ডাটাবেজে সেভ করা (Upsert logic)
+    app.post("/api/users", async (req, res) => {
+      const user = req.body;
+      const query = { email: user.email };
+      const existingUser = await usersCollection.findOne(query);
+
+      if (existingUser) {
+        return res.send({ message: "User already exists", insertedId: null });
+      }
+
+      // ডিফল্টভাবে সবাই 'user' এবং 'active' থাকবে
+      const result = await usersCollection.insertOne({
+        ...user,
+        role: "user",
+        status: "active",
+        createdAt: new Date().toISOString(),
+      });
+      res.send(result);
+    });
+
+    // ২. ইউজারের রোল চেক করা (Frontend-এ AdminRoute এর জন্য লাগবে)
+    app.get("/api/users/role/:email", async (req, res) => {
+      const email = req.params.email;
+      const user = await usersCollection.findOne({ email });
+      res.send({
+        role: user?.role || "user",
+        status: user?.status || "active",
+      });
+    });
+    // ৩. সব ইউজারদের লিস্ট পাওয়া (শুধুমাত্র অ্যাডমিনের জন্য)
+    app.get("/api/users", async (req, res) => {
+      const result = await usersCollection.find().toArray();
+      res.send(result);
+    });
+
+    // ৪. ইউজারের স্ট্যাটাস আপডেট (Active/Suspend)
+    app.patch("/api/users/status/:id", async (req, res) => {
+      const id = req.params.id;
+      const { status } = req.body; // status: 'suspended' or 'active'
+      const filter = { _id: new ObjectId(id) };
+      const updateDoc = { $set: { status: status } };
+      const result = await usersCollection.updateOne(filter, updateDoc);
+      res.send(result);
+    });
+
+    // ৫. সব ইভেন্ট ট্র্যাক করা (Admin tracking all events)
+    app.get("/api/admin/all-events", async (req, res) => {
+      const events = await eventsCollection.find().toArray();
+      res.send(events);
+    });
+
     // 1st. Event API রুট method: Post (POST/api/events)
 
     app.post("/api/events", async (req, res) => {
@@ -205,25 +258,39 @@ async function run() {
       }
     });
     // 7th. ইভেন্ট আপডেট করার API রুট (PUT /api/events/:id)
+    // এই রুটটি অ্যাডমিন এবং অর্গানাইজার (মালিক) উভয়ের জন্যই কাজ করবে
 
     app.put("/api/events/:id", async (req, res) => {
       const id = req.params.id;
       const updatedEventData = req.body;
-      const { organizerEmail, ...updateFields } = updatedEventData;
 
-      if (!ObjectId.isValid(id) || !organizerEmail) {
+      // ফ্রন্টেন্ড থেকে পাঠানো ডেটা এবং ইউজারের ইনফো (রোল এবং ইমেইল)
+      const { organizerEmail, userRole, ...updateFields } = updatedEventData;
+
+      // ১. ভ্যালিডেশন চেক
+      if (!ObjectId.isValid(id)) {
         return res.status(400).send({
           success: false,
-          message: "Invalid ID or missing organizer email.",
+          message: "Invalid ID format.",
         });
       }
 
       try {
-        const query = {
-          _id: new ObjectId(id),
-          organizerEmail: organizerEmail,
-        };
+        // ২. কুয়েরি তৈরি (Role-Based Authorization)
+        let query = { _id: new ObjectId(id) };
 
+        // যদি ইউজার 'admin' না হয়, তবে অবশ্যই তাকে ওই ইভেন্টের মালিক (Organizer) হতে হবে
+        if (userRole !== "admin") {
+          if (!organizerEmail) {
+            return res.status(400).send({
+              success: false,
+              message: "Organizer email is required for non-admin users.",
+            });
+          }
+          query.organizerEmail = organizerEmail;
+        }
+
+        // ৩. আপডেট করার জন্য ডেটা সেট করা
         const updateDoc = {
           $set: {
             eventName: updateFields.eventName,
@@ -232,28 +299,37 @@ async function run() {
             description: updateFields.description,
             image: updateFields.image,
             eventDate: updateFields.eventDate,
+            // অ্যাডমিন চাইলে সরাসরি স্ট্যাটাসও আপডেট করতে পারে (ঐচ্ছিক)
+            status: updateFields.status || "active",
           },
         };
 
+        // ৪. ডাটাবেজ আপডেট অপারেশন
         const result = await eventsCollection.updateOne(query, updateDoc);
 
+        // ৫. রেজাল্ট হ্যান্ডলিং
         if (result.matchedCount === 0) {
           return res.status(403).send({
             success: false,
-            message: "Forbidden: You can only update events you created.",
+            message:
+              "Forbidden: You don't have permission to update this event or event not found.",
           });
         }
 
         res.send({
           success: true,
-          message: "Event updated successfully!",
+          message:
+            userRole === "admin"
+              ? "Event updated by Admin successfully!"
+              : "Your event has been updated successfully!",
           modifiedCount: result.modifiedCount,
         });
       } catch (error) {
         console.error("Error updating event:", error);
-        res
-          .status(500)
-          .send({ success: false, message: "Failed to update event." });
+        res.status(500).send({
+          success: false,
+          message: "Internal server error while updating event.",
+        });
       }
     });
     // 8th. ইভেন্ট ডিলিট করার API রুট (DELETE /api/events/:id)
