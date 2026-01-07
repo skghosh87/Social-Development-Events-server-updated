@@ -1,17 +1,22 @@
 const express = require("express");
 const cors = require("cors");
-
 require("dotenv").config();
+
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const port = process.env.PORT || 5000;
 
-// Middleware
+/* =======================
+   Middleware
+======================= */
 app.use(cors());
 app.use(express.json());
 
+/* =======================
+   MongoDB Connection
+======================= */
 const uri = `mongodb+srv://${process.env.DB_UserName}:${process.env.DB_Password}@skghosh.wrzjkjg.mongodb.net/?appName=Skghosh`;
 
 const client = new MongoClient(uri, {
@@ -24,533 +29,303 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    // await client.connect();
-
     const database = client.db("socialdevelopmentevent");
+
     const eventsCollection = database.collection("events");
     const joinedEventsCollection = database.collection("joinedEvents");
     const usersCollection = database.collection("users");
-    // User  Api
-    // ১. ইউজার ডাটাবেজে সেভ করা (Upsert logic)
+
+    /* =======================
+       USERS API
+    ======================= */
+
+    // Create User (Upsert-like)
     app.post("/api/users", async (req, res) => {
       const user = req.body;
-      const query = { email: user.email };
-      const existingUser = await usersCollection.findOne(query);
+      const existingUser = await usersCollection.findOne({
+        email: user.email,
+      });
 
       if (existingUser) {
-        return res.send({ message: "User already exists", insertedId: null });
+        return res.send({ message: "User already exists" });
       }
 
-      // ডিফল্টভাবে সবাই 'user' এবং 'active' থাকবে
       const result = await usersCollection.insertOne({
         ...user,
         role: "user",
         status: "active",
         createdAt: new Date().toISOString(),
       });
+
       res.send(result);
     });
 
-    // ২. ইউজারের রোল চেক করা (Frontend-এ AdminRoute এর জন্য লাগবে)
+    // Get User Role
     app.get("/api/users/role/:email", async (req, res) => {
-      const email = req.params.email;
-      const user = await usersCollection.findOne({ email });
+      const user = await usersCollection.findOne({
+        email: req.params.email,
+      });
+
       res.send({
         role: user?.role || "user",
         status: user?.status || "active",
       });
     });
-    // ৩. সব ইউজারদের লিস্ট পাওয়া (শুধুমাত্র অ্যাডমিনের জন্য)
+
+    // All Users (Admin)
     app.get("/api/users", async (req, res) => {
-      const result = await usersCollection.find().toArray();
-      res.send(result);
+      const users = await usersCollection.find().toArray();
+      res.send(users);
     });
 
-    // ৪. ইউজারের স্ট্যাটাস আপডেট (Active/Suspend)
+    // Update User Status
     app.patch("/api/users/status/:id", async (req, res) => {
-      const id = req.params.id;
-      const { status } = req.body; // status: 'suspended' or 'active'
-      const filter = { _id: new ObjectId(id) };
-      const updateDoc = { $set: { status: status } };
-      const result = await usersCollection.updateOne(filter, updateDoc);
+      const result = await usersCollection.updateOne(
+        { _id: new ObjectId(req.params.id) },
+        { $set: { status: req.body.status } }
+      );
       res.send(result);
     });
 
-    // ৫. সব ইভেন্ট ট্র্যাক করা (Admin tracking all events)
-    app.get("/api/admin/all-events", async (req, res) => {
-      const events = await eventsCollection.find().toArray();
-      res.send(events);
-    });
+    /* =======================
+       EVENTS API
+    ======================= */
 
-    // 1st. Event API রুট method: Post (POST/api/events)
-
+    // Create Event
     app.post("/api/events", async (req, res) => {
-      const newEvent = req.body;
+      const event = {
+        ...req.body,
+        participants: 0,
+        status: "active",
+        postedAt: new Date().toISOString(),
+      };
 
-      if (!newEvent.eventName || !newEvent.organizerEmail) {
-        return res
-          .status(400)
-          .send({ success: false, message: "Missing required fields." });
-      }
-
-      try {
-        const result = await eventsCollection.insertOne(newEvent);
-        res.send({
-          success: true,
-          insertedId: result.insertedId,
-          message: "Event created successfully!",
-        });
-      } catch (error) {
-        res.status(500).send({
-          success: false,
-          message: "Failed to insert event into database.",
-        });
-      }
+      const result = await eventsCollection.insertOne(event);
+      res.send({ success: true, insertedId: result.insertedId });
     });
-    // 2nd. Upcoming Events API রুট (GET/api/events/upcoming)
 
+    // Upcoming Events
     app.get("/api/events/upcoming", async (req, res) => {
       const { category, search } = req.query;
-      const today = new Date().toISOString();
-      let query = { eventDate: { $gte: today } };
+      let query = { eventDate: { $gte: new Date().toISOString() } };
 
       if (category && category !== "all") {
-        query.eventType = category;
+        query.category = category;
       }
       if (search) {
-        query.eventName = { $regex: new RegExp(search, "i") };
+        query.eventName = { $regex: search, $options: "i" };
       }
-      try {
-        const events = await eventsCollection
-          .find(query)
-          .sort({ eventDate: 1 })
-          .toArray();
-        res.send({ success: true, events });
-      } catch (error) {
-        res.status(500).send({
-          success: false,
-          message: "Failed to fetch upcoming events.",
-        });
-      }
-    });
-    // 3rd. Single Event Details দেখানোর API রুট (GET /api/events/:id)
 
+      const events = await eventsCollection
+        .find(query)
+        .sort({ eventDate: 1 })
+        .toArray();
+
+      res.send({ success: true, events });
+    });
+
+    // Single Event
     app.get("/api/events/:id", async (req, res) => {
-      const id = req.params.id;
-      if (!ObjectId.isValid(id)) {
-        return res
-          .status(400)
-          .send({ success: false, message: "Invalid Event ID format." });
-      }
-      const query = { _id: new ObjectId(id) };
-      try {
-        const event = await eventsCollection.findOne(query);
-        if (!event) {
-          return res
-            .status(404)
-            .send({ success: false, message: "Event not found." });
-        }
-        res.send({ success: true, event });
-      } catch (error) {
-        res
-          .status(500)
-          .send({ success: false, message: "Failed to fetch event details." });
-      }
+      const event = await eventsCollection.findOne({
+        _id: new ObjectId(req.params.id),
+      });
+      res.send({ success: true, event });
     });
-    // 4th. Joined Events দেখানোর API রুট (GET /api/joined-events/:email)
 
-    app.get("/api/joined-events/:email", async (req, res) => {
-      const userEmail = req.params.email;
-      try {
-        const joinedRecords = await joinedEventsCollection
-          .find({ userEmail: userEmail })
-          .toArray();
+    // Organizer Events
+    app.get("/api/events/organizer/:email", async (req, res) => {
+      const events = await eventsCollection
+        .find({ organizerEmail: req.params.email })
+        .sort({ postedAt: -1 })
+        .toArray();
 
-        const eventIds = joinedRecords.map(
-          (record) => new ObjectId(record.eventId)
-        );
-
-        const joinedEvents = await eventsCollection
-          .find({ _id: { $in: eventIds } })
-          .sort({ eventDate: 1 })
-          .toArray();
-
-        res.send(joinedEvents);
-      } catch (error) {
-        console.error("Error fetching joined events:", error);
-        res
-          .status(500)
-          .send({ success: false, message: "Failed to fetch joined events." });
-      }
+      res.send({ success: true, events });
     });
-    // ৫ নম্বর এপিআই আপডেট করুন (POST /api/join-event)
+
+    // Update Event (Admin / Organizer)
+    app.put("/api/events/:id", async (req, res) => {
+      const { organizerEmail, userRole, ...updateFields } = req.body;
+
+      let query = { _id: new ObjectId(req.params.id) };
+      if (userRole !== "admin") {
+        query.organizerEmail = organizerEmail;
+      }
+
+      const result = await eventsCollection.updateOne(query, {
+        $set: updateFields,
+      });
+
+      if (result.matchedCount === 0) {
+        return res.status(403).send({ message: "Unauthorized" });
+      }
+
+      res.send({ success: true });
+    });
+
+    // Delete Event
+    app.delete("/api/events/:id", async (req, res) => {
+      const { organizerEmail } = req.query;
+
+      const result = await eventsCollection.deleteOne({
+        _id: new ObjectId(req.params.id),
+        organizerEmail,
+      });
+
+      await joinedEventsCollection.deleteMany({
+        eventId: req.params.id,
+      });
+
+      res.send({ success: true, deletedCount: result.deletedCount });
+    });
+
+    /* =======================
+       JOIN EVENTS
+    ======================= */
+
     app.post("/api/join-event", async (req, res) => {
       const { eventId, userEmail, userName, amount, transactionId } = req.body;
 
-      if (!eventId || !userEmail) {
-        return res
-          .status(400)
-          .send({ success: false, message: "Missing Event ID or User Email." });
+      const exists = await joinedEventsCollection.findOne({
+        eventId,
+        userEmail,
+      });
+
+      if (exists) {
+        return res.status(409).send({ message: "Already joined" });
       }
 
-      try {
-        // আগে জয়েন করেছে কি না চেক করা
-        const existingJoin = await joinedEventsCollection.findOne({
-          eventId,
-          userEmail,
-        });
+      await joinedEventsCollection.insertOne({
+        eventId,
+        userEmail,
+        userName,
+        amount: amount || 0,
+        transactionId: transactionId || "free",
+        joinedDate: new Date().toISOString(),
+      });
 
-        if (existingJoin) {
-          return res.status(409).send({
-            success: false,
-            message: "You have already joined this event.",
-          });
-        }
+      await eventsCollection.updateOne(
+        { _id: new ObjectId(eventId) },
+        { $inc: { participants: 1 } }
+      );
 
-        // নতুন রেকর্ড তৈরি (টাকাসহ)
-        const joinRecord = {
-          eventId,
-          userEmail,
-          userName: userName || "Anonymous",
-          amount: parseFloat(amount) || 0, // কত ডলার দিল
-          transactionId: transactionId || "free", // অ্যাডমিন/অর্গানাইজার হলে free
-          joinedDate: new Date().toISOString(),
-        };
-
-        const result = await joinedEventsCollection.insertOne(joinRecord);
-
-        // ইভেন্ট কালেকশনে পার্টিসিপেন্ট সংখ্যা বাড়ানো
-        await eventsCollection.updateOne(
-          { _id: new ObjectId(eventId) },
-          { $inc: { participants: 1 } }
-        );
-
-        res.send({ success: true, insertedId: result.insertedId });
-      } catch (error) {
-        res
-          .status(500)
-          .send({ success: false, message: "Server error while joining." });
-      }
+      res.send({ success: true });
     });
-    // 6th. নিজের তৈরি করা ইভেন্ট লোড করার API রুট (GET /api/events/organizer/:email)
 
-    app.get("/api/events/organizer/:email", async (req, res) => {
-      const organizerEmail = req.params.email;
-      if (!organizerEmail) {
-        return res
-          .status(400)
-          .send({ success: false, message: "Organizer Email is required." });
-      }
-      try {
-        const query = { organizerEmail: organizerEmail };
-        const myEvents = await eventsCollection
-          .find(query)
-          .sort({ postedAt: -1 })
-          .toArray();
-        res.send({ success: true, events: myEvents });
-      } catch (error) {
-        console.error("Error fetching my events:", error);
-        res.status(500).send({
-          success: false,
-          message: "Failed to fetch events created by user.",
-        });
-      }
+    app.get("/api/joined-events/:email", async (req, res) => {
+      const joins = await joinedEventsCollection
+        .find({ userEmail: req.params.email })
+        .toArray();
+
+      const ids = joins.map((j) => new ObjectId(j.eventId));
+
+      const events = await eventsCollection
+        .find({ _id: { $in: ids } })
+        .toArray();
+
+      res.send(events);
     });
-    // 7th. ইভেন্ট আপডেট করার API রুট (PUT /api/events/:id)
-    // এই রুটটি অ্যাডমিন এবং অর্গানাইজার (মালিক) উভয়ের জন্যই কাজ করবে
 
-    app.put("/api/events/:id", async (req, res) => {
-      const id = req.params.id;
-      const updatedEventData = req.body;
+    /* =======================
+       STRIPE PAYMENT
+    ======================= */
 
-      // ফ্রন্টেন্ড থেকে পাঠানো ডেটা এবং ইউজারের ইনফো (রোল এবং ইমেইল)
-      const { organizerEmail, userRole, ...updateFields } = updatedEventData;
-
-      // ১. ভ্যালিডেশন চেক
-      if (!ObjectId.isValid(id)) {
-        return res.status(400).send({
-          success: false,
-          message: "Invalid ID format.",
-        });
-      }
-
-      try {
-        // ২. কুয়েরি তৈরি (Role-Based Authorization)
-        let query = { _id: new ObjectId(id) };
-
-        // যদি ইউজার 'admin' না হয়, তবে অবশ্যই তাকে ওই ইভেন্টের মালিক (Organizer) হতে হবে
-        if (userRole !== "admin") {
-          if (!organizerEmail) {
-            return res.status(400).send({
-              success: false,
-              message: "Organizer email is required for non-admin users.",
-            });
-          }
-          query.organizerEmail = organizerEmail;
-        }
-
-        // ৩. আপডেট করার জন্য ডেটা সেট করা
-        const updateDoc = {
-          $set: {
-            eventName: updateFields.eventName,
-            category: updateFields.category,
-            location: updateFields.location,
-            description: updateFields.description,
-            image: updateFields.image,
-            eventDate: updateFields.eventDate,
-            // অ্যাডমিন চাইলে সরাসরি স্ট্যাটাসও আপডেট করতে পারে (ঐচ্ছিক)
-            status: updateFields.status || "active",
-          },
-        };
-
-        // ৪. ডাটাবেজ আপডেট অপারেশন
-        const result = await eventsCollection.updateOne(query, updateDoc);
-
-        // ৫. রেজাল্ট হ্যান্ডলিং
-        if (result.matchedCount === 0) {
-          return res.status(403).send({
-            success: false,
-            message:
-              "Forbidden: You don't have permission to update this event or event not found.",
-          });
-        }
-
-        res.send({
-          success: true,
-          message:
-            userRole === "admin"
-              ? "Event updated by Admin successfully!"
-              : "Your event has been updated successfully!",
-          modifiedCount: result.modifiedCount,
-        });
-      } catch (error) {
-        console.error("Error updating event:", error);
-        res.status(500).send({
-          success: false,
-          message: "Internal server error while updating event.",
-        });
-      }
-    });
-    // 8th. ইভেন্ট ডিলিট করার API রুট (DELETE /api/events/:id)
-
-    app.delete("/api/events/:id", async (req, res) => {
-      const id = req.params.id;
-
-      const { organizerEmail } = req.query;
-
-      if (!ObjectId.isValid(id) || !organizerEmail) {
-        return res.status(400).send({
-          success: false,
-          message: "Invalid ID or missing organizer email.",
-        });
-      }
-
-      try {
-        const query = {
-          _id: new ObjectId(id),
-          organizerEmail: organizerEmail,
-        };
-
-        const result = await eventsCollection.deleteOne(query);
-
-        if (result.deletedCount === 0) {
-          return res.status(403).send({
-            success: false,
-            message:
-              "Forbidden: You can only delete events you created or event not found.",
-          });
-        }
-
-        await joinedEventsCollection.deleteMany({ eventId: id });
-
-        res.send({
-          success: true,
-          message: "Event deleted successfully!",
-          deletedCount: result.deletedCount,
-        });
-      } catch (error) {
-        console.error("Error deleting event:", error);
-        res
-          .status(500)
-          .send({ success: false, message: "Failed to delete event." });
-      }
-    });
-    // ড্যাশবোর্ড স্ট্যাটাস এবং চার্ট ডেটার জন্য API
-    app.get("/api/admin-stats", async (req, res) => {
-      try {
-        const totalEvents = await eventsCollection.estimatedDocumentCount();
-        const totalJoins =
-          await joinedEventsCollection.estimatedDocumentCount();
-
-        // ক্যাটাগরি অনুযায়ী ইভেন্ট সংখ্যা (Pie Chart এর জন্য)
-        const categoryStats = await eventsCollection
-          .aggregate([
-            { $group: { _id: "$eventType", value: { $sum: 1 } } },
-            { $project: { name: "$_id", value: 1, _id: 0 } },
-          ])
-          .toArray();
-
-        res.send({
-          totalEvents,
-          totalJoins,
-          categoryStats,
-        });
-      } catch (error) {
-        res.status(500).send({ message: "Failed to fetch stats" });
-      }
-    });
-    // পেমেন্ট ইনটেন্ট তৈরি করার API
     app.post("/api/create-payment-intent", async (req, res) => {
       const { price } = req.body;
-      if (!price) return res.status(400).send({ message: "Price is required" });
 
-      const amount = parseInt(price * 100); // সেন্টে রূপান্তর
+      if (!price || isNaN(price) || price < 1) {
+        return res.status(400).send({ message: "Invalid amount" });
+      }
+
+      const amount = Math.round(price * 100);
 
       const paymentIntent = await stripe.paymentIntents.create({
-        amount: amount,
+        amount,
         currency: "usd",
         payment_method_types: ["card"],
       });
 
-      res.send({
-        clientSecret: paymentIntent.client_secret,
-      });
+      res.send({ clientSecret: paymentIntent.client_secret });
     });
-    // নতুন এপিআই: ইভেন্ট অনুযায়ী কালেকশন স্ট্যাটাস (অ্যাডমিনের জন্য)
-    app.get("/api/admin/event-revenue", async (req, res) => {
-      try {
-        const revenueStats = await joinedEventsCollection
-          .aggregate([
-            {
-              $group: {
-                _id: "$eventId",
-                totalRevenue: { $sum: "$amount" },
-                totalParticipants: { $sum: 1 },
-              },
-            },
-            {
-              $addFields: { eventIdObj: { $toObjectId: "$_id" } },
-            },
-            {
-              $lookup: {
-                from: "events",
-                localField: "eventIdObj",
-                foreignField: "_id",
-                as: "eventDetails",
-              },
-            },
-            { $unwind: "$eventDetails" },
-            {
-              $project: {
-                _id: 1,
-                totalRevenue: 1,
-                totalParticipants: 1,
-                eventName: "$eventDetails.eventName",
-                organizerEmail: "$eventDetails.organizerEmail",
-              },
-            },
-          ])
-          .toArray();
 
-        res.send(revenueStats);
-      } catch (error) {
-        res.status(500).send({ message: "Failed to fetch revenue stats" });
-      }
-    });
+    /* =======================
+       ADMIN DASHBOARD STATS
+    ======================= */
 
     app.get("/api/admin-stats", async (req, res) => {
-      try {
-        const days = parseInt(req.query.days) || 7; // ডিফল্ট ৭ দিন
-        const dateLimit = new Date();
-        dateLimit.setDate(dateLimit.getDate() - days);
+      const days = parseInt(req.query.days) || 7;
+      const dateLimit = new Date();
+      dateLimit.setDate(dateLimit.getDate() - days);
 
-        // ১. মোট ইভেন্ট এবং মোট ইউজার সংখ্যা (Simple Count)
-        const totalEvents = await eventsCollection.countDocuments();
-        const totalUsers = await usersCollection.countDocuments(); // আপনার ইউজার কালেকশন থাকলে
+      const totalEvents = await eventsCollection.countDocuments();
+      const totalUsers = await usersCollection.countDocuments();
 
-        // ২. ফিল্টার অনুযায়ী আর্নিং এবং জয়েনার এগ্রিগেশন
-        const stats = await joinedEventsCollection
-          .aggregate([
-            {
-              $match: {
-                // পেমেন্টের তারিখটি নির্দিষ্ট সীমার মধ্যে হতে হবে
-                date: { $gte: dateLimit.toISOString() },
-              },
+      const stats = await joinedEventsCollection
+        .aggregate([
+          {
+            $match: {
+              joinedDate: { $gte: dateLimit.toISOString() },
             },
-            {
-              $group: {
-                _id: null,
-                totalEarnings: { $sum: "$amount" },
-                totalJoined: { $count: {} },
-              },
+          },
+          {
+            $group: {
+              _id: null,
+              totalEarnings: { $sum: "$amount" },
+              totalJoined: { $sum: 1 },
             },
-          ])
-          .toArray();
+          },
+        ])
+        .toArray();
 
-        // ৩. চার্টের জন্য ডাটা (প্রতিদিনের আর্নিং গ্রাফ)
-        const chartData = await joinedEventsCollection
-          .aggregate([
-            { $match: { date: { $gte: dateLimit.toISOString() } } },
-            {
-              $group: {
-                _id: { $substr: ["$date", 0, 10] }, // YYYY-MM-DD ফরম্যাটে গ্রুপ করা
-                amount: { $sum: "$amount" },
-              },
+      const chartData = await joinedEventsCollection
+        .aggregate([
+          {
+            $match: {
+              joinedDate: { $gte: dateLimit.toISOString() },
             },
-            { $sort: { _id: 1 } },
-            {
-              $project: {
-                name: "$_id",
-                amount: 1,
-                _id: 0,
-              },
+          },
+          {
+            $group: {
+              _id: { $substr: ["$joinedDate", 0, 10] },
+              amount: { $sum: "$amount" },
             },
-          ])
-          .toArray();
+          },
+          { $sort: { _id: 1 } },
+          { $project: { name: "$_id", amount: 1, _id: 0 } },
+        ])
+        .toArray();
 
-        // ৪. ক্যাটাগরি অনুযায়ী ডিস্ট্রিবিউশন (Pie Chart এর জন্য)
-        const categoryData = await eventsCollection
-          .aggregate([
-            { $group: { _id: "$category", value: { $count: {} } } },
-            { $project: { name: "$_id", value: 1, _id: 0 } },
-          ])
-          .toArray();
-
-        res.send({
-          totalEvents,
-          totalUsers,
-          totalEarnings: stats[0]?.totalEarnings || 0,
-          totalJoined: stats[0]?.totalJoined || 0,
-          chartData,
-          categoryData,
-        });
-      } catch (error) {
-        res.status(500).send({ message: "Server Error", error });
-      }
+      res.send({
+        totalEvents,
+        totalUsers,
+        totalEarnings: stats[0]?.totalEarnings || 0,
+        totalJoined: stats[0]?.totalJoined || 0,
+        chartData,
+      });
     });
+
+    // Recent Joins
     app.get("/api/recent-joins", async (req, res) => {
-      const result = await joinedEventsCollection
+      const joins = await joinedEventsCollection
         .find()
-        .sort({ date: -1 }) // সর্বশেষ পেমেন্ট আগে আসবে
+        .sort({ joinedDate: -1 })
         .limit(10)
         .toArray();
-      res.send(result);
+
+      res.send(joins);
     });
-    // await client.db("admin").command({ ping: 1 });
-    console.log(
-      "Pinged your deployment. You successfully connected to MongoDB!"
-    );
+
+    console.log("✅ MongoDB Connected Successfully");
   } catch (error) {
-    console.error("MongoDB connection error:", error);
+    console.error(error);
   }
 }
 
-run().catch(console.dir);
+run();
 
 app.get("/", (req, res) => {
-  res.send("Social Development Events Server is Running!");
+  res.send("Social Development Events Server Running 🚀");
 });
 
 app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
+  console.log(`🚀 Server running on port ${port}`);
 });
