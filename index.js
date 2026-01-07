@@ -183,10 +183,9 @@ async function run() {
           .send({ success: false, message: "Failed to fetch joined events." });
       }
     });
-    // 5th. Event Join করার API রুট (POST /api/join-event)
-
+    // ৫ নম্বর এপিআই আপডেট করুন (POST /api/join-event)
     app.post("/api/join-event", async (req, res) => {
-      const { eventId, userEmail } = req.body;
+      const { eventId, userEmail, userName, amount, transactionId } = req.body;
 
       if (!eventId || !userEmail) {
         return res
@@ -195,9 +194,10 @@ async function run() {
       }
 
       try {
+        // আগে জয়েন করেছে কি না চেক করা
         const existingJoin = await joinedEventsCollection.findOne({
-          eventId: eventId,
-          userEmail: userEmail,
+          eventId,
+          userEmail,
         });
 
         if (existingJoin) {
@@ -207,30 +207,29 @@ async function run() {
           });
         }
 
+        // নতুন রেকর্ড তৈরি (টাকাসহ)
         const joinRecord = {
-          eventId: eventId,
-          userEmail: userEmail,
+          eventId,
+          userEmail,
+          userName: userName || "Anonymous",
+          amount: parseFloat(amount) || 0, // কত ডলার দিল
+          transactionId: transactionId || "free", // অ্যাডমিন/অর্গানাইজার হলে free
           joinedDate: new Date().toISOString(),
         };
 
         const result = await joinedEventsCollection.insertOne(joinRecord);
 
+        // ইভেন্ট কালেকশনে পার্টিসিপেন্ট সংখ্যা বাড়ানো
         await eventsCollection.updateOne(
           { _id: new ObjectId(eventId) },
           { $inc: { participants: 1 } }
         );
 
-        res.send({
-          success: true,
-          insertedId: result.insertedId,
-          message: "Successfully joined the event!",
-        });
+        res.send({ success: true, insertedId: result.insertedId });
       } catch (error) {
-        console.error("Error joining event:", error);
-        res.status(500).send({
-          success: false,
-          message: "Failed to join event due to server error.",
-        });
+        res
+          .status(500)
+          .send({ success: false, message: "Server error while joining." });
       }
     });
     // 6th. নিজের তৈরি করা ইভেন্ট লোড করার API রুট (GET /api/events/organizer/:email)
@@ -417,7 +416,61 @@ async function run() {
         clientSecret: paymentIntent.client_secret,
       });
     });
+    // নতুন এপিআই: ইভেন্ট অনুযায়ী কালেকশন স্ট্যাটাস (অ্যাডমিনের জন্য)
+    app.get("/api/admin/event-revenue", async (req, res) => {
+      try {
+        const revenueStats = await joinedEventsCollection
+          .aggregate([
+            {
+              $group: {
+                _id: "$eventId",
+                totalRevenue: { $sum: "$amount" },
+                totalParticipants: { $sum: 1 },
+              },
+            },
+            {
+              $addFields: { eventIdObj: { $toObjectId: "$_id" } },
+            },
+            {
+              $lookup: {
+                from: "events",
+                localField: "eventIdObj",
+                foreignField: "_id",
+                as: "eventDetails",
+              },
+            },
+            { $unwind: "$eventDetails" },
+            {
+              $project: {
+                _id: 1,
+                totalRevenue: 1,
+                totalParticipants: 1,
+                eventName: "$eventDetails.eventName",
+                organizerEmail: "$eventDetails.organizerEmail",
+              },
+            },
+          ])
+          .toArray();
 
+        res.send(revenueStats);
+      } catch (error) {
+        res.status(500).send({ message: "Failed to fetch revenue stats" });
+      }
+    });
+
+    app.get("/api/admin-stats", async (req, res) => {
+      const totalEvents = await eventsCollection.countDocuments();
+      const totalJoined = await joinedEventsCollection.countDocuments();
+
+      // টোটাল উপার্জন (অর্গানাইজার এবং জয়েনার মিলিয়ে)
+      const earningsData = await joinedEventsCollection
+        .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
+        .toArray();
+
+      const totalEarnings = earningsData[0]?.total || 0;
+
+      res.send({ totalEvents, totalJoined, totalEarnings });
+    });
     // await client.db("admin").command({ ping: 1 });
     console.log(
       "Pinged your deployment. You successfully connected to MongoDB!"
