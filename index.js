@@ -459,17 +459,82 @@ async function run() {
     });
 
     app.get("/api/admin-stats", async (req, res) => {
-      const totalEvents = await eventsCollection.countDocuments();
-      const totalJoined = await joinedEventsCollection.countDocuments();
+      try {
+        const days = parseInt(req.query.days) || 7; // ডিফল্ট ৭ দিন
+        const dateLimit = new Date();
+        dateLimit.setDate(dateLimit.getDate() - days);
 
-      // টোটাল উপার্জন (অর্গানাইজার এবং জয়েনার মিলিয়ে)
-      const earningsData = await joinedEventsCollection
-        .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
+        // ১. মোট ইভেন্ট এবং মোট ইউজার সংখ্যা (Simple Count)
+        const totalEvents = await eventsCollection.countDocuments();
+        const totalUsers = await usersCollection.countDocuments(); // আপনার ইউজার কালেকশন থাকলে
+
+        // ২. ফিল্টার অনুযায়ী আর্নিং এবং জয়েনার এগ্রিগেশন
+        const stats = await joinedEventsCollection
+          .aggregate([
+            {
+              $match: {
+                // পেমেন্টের তারিখটি নির্দিষ্ট সীমার মধ্যে হতে হবে
+                date: { $gte: dateLimit.toISOString() },
+              },
+            },
+            {
+              $group: {
+                _id: null,
+                totalEarnings: { $sum: "$amount" },
+                totalJoined: { $count: {} },
+              },
+            },
+          ])
+          .toArray();
+
+        // ৩. চার্টের জন্য ডাটা (প্রতিদিনের আর্নিং গ্রাফ)
+        const chartData = await joinedEventsCollection
+          .aggregate([
+            { $match: { date: { $gte: dateLimit.toISOString() } } },
+            {
+              $group: {
+                _id: { $substr: ["$date", 0, 10] }, // YYYY-MM-DD ফরম্যাটে গ্রুপ করা
+                amount: { $sum: "$amount" },
+              },
+            },
+            { $sort: { _id: 1 } },
+            {
+              $project: {
+                name: "$_id",
+                amount: 1,
+                _id: 0,
+              },
+            },
+          ])
+          .toArray();
+
+        // ৪. ক্যাটাগরি অনুযায়ী ডিস্ট্রিবিউশন (Pie Chart এর জন্য)
+        const categoryData = await eventsCollection
+          .aggregate([
+            { $group: { _id: "$category", value: { $count: {} } } },
+            { $project: { name: "$_id", value: 1, _id: 0 } },
+          ])
+          .toArray();
+
+        res.send({
+          totalEvents,
+          totalUsers,
+          totalEarnings: stats[0]?.totalEarnings || 0,
+          totalJoined: stats[0]?.totalJoined || 0,
+          chartData,
+          categoryData,
+        });
+      } catch (error) {
+        res.status(500).send({ message: "Server Error", error });
+      }
+    });
+    app.get("/api/recent-joins", async (req, res) => {
+      const result = await joinedEventsCollection
+        .find()
+        .sort({ date: -1 }) // সর্বশেষ পেমেন্ট আগে আসবে
+        .limit(10)
         .toArray();
-
-      const totalEarnings = earningsData[0]?.total || 0;
-
-      res.send({ totalEvents, totalJoined, totalEarnings });
+      res.send(result);
     });
     // await client.db("admin").command({ ping: 1 });
     console.log(
