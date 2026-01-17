@@ -1,7 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
-
+const jwt = require("jsonwebtoken");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
@@ -9,13 +9,21 @@ const app = express();
 const port = process.env.PORT || 5000;
 
 /* =======================
-   Middleware
+    Middleware
 ======================= */
-app.use(cors());
+app.use(
+  cors({
+    origin: [
+      "http://localhost:5173",
+      "https://socialdevelopmenteventproject.netlify.app",
+    ],
+    credentials: true,
+  }),
+);
 app.use(express.json());
 
 /* =======================
-   MongoDB Connection
+    MongoDB Connection
 ======================= */
 const uri = `mongodb+srv://${process.env.DB_UserName}:${process.env.DB_Password}@skghosh.wrzjkjg.mongodb.net/?appName=Skghosh`;
 
@@ -27,219 +35,123 @@ const client = new MongoClient(uri, {
   },
 });
 
+/* =======================
+    Custom Middlewares
+======================= */
+const verifyToken = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader)
+    return res.status(401).send({ message: "Unauthorized access" });
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
+      if (err) {
+        return res.status(403).send({ message: "Forbidden access" });
+      }
+      req.decoded = decoded;
+      next();
+    });
+  } catch (error) {
+    res
+      .status(500)
+      .send({ message: "Internal server error during token verification" });
+  }
+};
+
 async function run() {
   try {
     const database = client.db("socialdevelopmentevent");
-
+    const usersCollection = database.collection("users");
     const eventsCollection = database.collection("events");
     const joinedEventsCollection = database.collection("joinedEvents");
-    const usersCollection = database.collection("users");
+
+    // Admin Verification Middleware
+    const verifyAdmin = async (req, res, next) => {
+      const email = req.decoded.email;
+      const user = await usersCollection.findOne({ email });
+      if (user?.role !== "admin") {
+        return res
+          .status(403)
+          .send({ message: "Forbidden: Admin access only" });
+      }
+      next();
+    };
 
     /* =======================
-       USERS API
+        AUTH / JWT
     ======================= */
+    app.post("/api/jwt", async (req, res) => {
+      const { email } = req.body;
+      const token = jwt.sign({ email }, process.env.ACCESS_TOKEN_SECRET, {
+        // expiresIn: "7d",
+      });
+      res.send({ token });
+    });
 
-    // Create User (Upsert-like)
+    /* =======================
+        USERS API
+    ======================= */
     app.post("/api/users", async (req, res) => {
       const user = req.body;
-      const existingUser = await usersCollection.findOne({
-        email: user.email,
-      });
-
-      if (existingUser) {
-        return res.send({ message: "User already exists" });
-      }
+      const exists = await usersCollection.findOne({ email: user.email });
+      if (exists)
+        return res.send({ message: "User already exists", insertedId: null });
 
       const result = await usersCollection.insertOne({
         ...user,
         role: "user",
         status: "active",
-        createdAt: new Date().toISOString(),
+        createdAt: new Date(),
       });
-
       res.send(result);
     });
 
-    // Get User Role
-    app.get("/api/users/role/:email", async (req, res) => {
-      const user = await usersCollection.findOne({
-        email: req.params.email,
-      });
-
-      res.send({
-        role: user?.role || "user",
-        status: user?.status || "active",
-      });
-    });
-
-    // All Users (Admin)
-    app.get("/api/users", async (req, res) => {
-      const users = await usersCollection.find().toArray();
-      res.send(users);
-    });
-
-    // Update User Status
-    app.patch("/api/users/status/:id", async (req, res) => {
-      const result = await usersCollection.updateOne(
-        { _id: new ObjectId(req.params.id) },
-        { $set: { status: req.body.status } }
-      );
+    app.get("/api/users", verifyToken, verifyAdmin, async (req, res) => {
+      const result = await usersCollection.find().toArray();
       res.send(result);
     });
 
-    /* =======================
-       EVENTS API
-    ======================= */
-
-    // Create Event
-    app.post("/api/events", async (req, res) => {
-      const event = {
-        ...req.body,
-        participants: 0,
-        status: "active",
-        postedAt: new Date().toISOString(),
-      };
-
-      const result = await eventsCollection.insertOne(event);
-      res.send({ success: true, insertedId: result.insertedId });
+    app.get("/api/users/role/:email", verifyToken, async (req, res) => {
+      const email = req.params.email;
+      if (email !== req.decoded.email)
+        return res.status(403).send({ message: "Forbidden" });
+      const user = await usersCollection.findOne({ email });
+      res.send({ admin: user?.role === "admin", status: user?.status });
     });
 
-    // Upcoming Events
-    app.get("/api/events/upcoming", async (req, res) => {
-      const { category, search } = req.query;
-      let query = { eventDate: { $gte: new Date().toISOString() } };
+    app.patch(
+      "/api/users/status/:id",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        const id = req.params.id;
+        const { status, role } = req.body;
+        const filter = { _id: new ObjectId(id) };
 
-      if (category && category !== "all") {
-        query.category = category;
-      }
-      if (search) {
-        query.eventName = { $regex: search, $options: "i" };
-      }
+        // ১. আপডেট ডকুমেন্ট তৈরি
+        const updateDoc = { $set: {} };
+        if (status) updateDoc.$set.status = status;
+        if (role) updateDoc.$set.role = role;
 
-      const events = await eventsCollection
-        .find(query)
-        .sort({ eventDate: 1 })
-        .toArray();
-
-      res.send({ success: true, events });
-    });
-
-    // Single Event
-    app.get("/api/events/:id", async (req, res) => {
-      const event = await eventsCollection.findOne({
-        _id: new ObjectId(req.params.id),
-      });
-      res.send({ success: true, event });
-    });
-
-    // Organizer Events
-    app.get("/api/events/organizer/:email", async (req, res) => {
-      const events = await eventsCollection
-        .find({ organizerEmail: req.params.email })
-        .sort({ postedAt: -1 })
-        .toArray();
-
-      res.send({ success: true, events });
-    });
-
-    // Update Event (Admin / Organizer)
-    app.put("/api/events/:id", async (req, res) => {
-      const { organizerEmail, userRole, ...updateFields } = req.body;
-
-      let query = { _id: new ObjectId(req.params.id) };
-      if (userRole !== "admin") {
-        query.organizerEmail = organizerEmail;
-      }
-
-      const result = await eventsCollection.updateOne(query, {
-        $set: updateFields,
-      });
-
-      if (result.matchedCount === 0) {
-        return res.status(403).send({ message: "Unauthorized" });
-      }
-
-      res.send({ success: true });
-    });
-
-    // Delete Event
-    app.delete("/api/events/:id", async (req, res) => {
-      const { organizerEmail } = req.query;
-
-      const result = await eventsCollection.deleteOne({
-        _id: new ObjectId(req.params.id),
-        organizerEmail,
-      });
-
-      await joinedEventsCollection.deleteMany({
-        eventId: req.params.id,
-      });
-
-      res.send({ success: true, deletedCount: result.deletedCount });
-    });
+        // ২. ডাটাবেস আপডেট
+        const result = await usersCollection.updateOne(filter, updateDoc);
+        res.send(result);
+      },
+    );
 
     /* =======================
-       JOIN EVENTS
+        STRIPE PAYMENT
     ======================= */
-
-    app.post("/api/join-event", async (req, res) => {
-      const { eventId, userEmail, userName, amount, transactionId } = req.body;
-
-      const exists = await joinedEventsCollection.findOne({
-        eventId,
-        userEmail,
-      });
-
-      if (exists) {
-        return res.status(409).send({ message: "Already joined" });
-      }
-
-      await joinedEventsCollection.insertOne({
-        eventId,
-        userEmail,
-        userName,
-        amount: amount || 0,
-        transactionId: transactionId || "free",
-        joinedDate: new Date().toISOString(),
-      });
-
-      await eventsCollection.updateOne(
-        { _id: new ObjectId(eventId) },
-        { $inc: { participants: 1 } }
-      );
-
-      res.send({ success: true });
-    });
-
-    app.get("/api/joined-events/:email", async (req, res) => {
-      const joins = await joinedEventsCollection
-        .find({ userEmail: req.params.email })
-        .toArray();
-
-      const ids = joins.map((j) => new ObjectId(j.eventId));
-
-      const events = await eventsCollection
-        .find({ _id: { $in: ids } })
-        .toArray();
-
-      res.send(events);
-    });
-
-    /* =======================
-       STRIPE PAYMENT
-    ======================= */
-
-    app.post("/api/create-payment-intent", async (req, res) => {
+    app.post("/api/create-payment-intent", verifyToken, async (req, res) => {
       const { price } = req.body;
-
-      if (!price || isNaN(price) || price < 1) {
+      const amount = parseInt(price * 100);
+      if (!amount || amount < 1)
         return res.status(400).send({ message: "Invalid amount" });
-      }
-
-      const amount = Math.round(price * 100);
 
       const paymentIntent = await stripe.paymentIntents.create({
-        amount,
+        amount: amount,
         currency: "usd",
         payment_method_types: ["card"],
       });
@@ -248,84 +160,330 @@ async function run() {
     });
 
     /* =======================
-       ADMIN DASHBOARD STATS
+        EVENTS API
     ======================= */
 
-    app.get("/api/admin-stats", async (req, res) => {
-      const days = parseInt(req.query.days) || 7;
-      const dateLimit = new Date();
-      dateLimit.setDate(dateLimit.getDate() - days);
+    // ১. সকল একটিভ ইভেন্ট (Upcoming)
+    app.get("/api/events/upcoming", async (req, res) => {
+      const { search, category } = req.query;
+      try {
+        let query = { status: "active" };
+        if (search) query.eventName = { $regex: search, $options: "i" };
+        if (category && category !== "" && category !== "All")
+          query.category = category;
 
+        const events = await eventsCollection
+          .find(query)
+          .sort({ eventDate: 1 })
+          .toArray();
+        res.send(events);
+      } catch (error) {
+        res.status(500).send({ message: "Internal Server Error" });
+      }
+    });
+
+    // ২. ইভেন্ট ম্যানেজ
+    app.get("/api/events/manage/:email", verifyToken, async (req, res) => {
+      try {
+        const email = req.params.email;
+        if (email !== req.decoded.email)
+          return res.status(403).send({ message: "Forbidden" });
+
+        const user = await usersCollection.findOne({ email });
+        let query = {};
+        if (user?.role !== "admin") {
+          query = { organizerEmail: email };
+        }
+
+        const result = await eventsCollection.find(query).toArray();
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Error fetching management events" });
+      }
+    });
+
+    // ৩. নির্দিষ্ট ইভেন্ট ডিটেইলস
+    app.get("/api/events/:id", async (req, res) => {
+      const id = req.params.id;
+      if (!ObjectId.isValid(id))
+        return res.status(400).send({ message: "Invalid ID format" });
+
+      try {
+        const result = await eventsCollection.findOne({
+          _id: new ObjectId(id),
+        });
+        if (!result)
+          return res.status(404).send({ message: "Event not found" });
+        res.send(result);
+      } catch (err) {
+        res.status(500).send({ message: "Server error" });
+      }
+    });
+
+    // ৪. ইভেন্ট তৈরি করা
+    app.post("/api/events", verifyToken, async (req, res) => {
+      const email = req.decoded.email;
+      const user = await usersCollection.findOne({ email });
+
+      if (user.status !== "active")
+        return res.status(403).send({ message: "Account suspended" });
+
+      const eventData = {
+        ...req.body,
+        organizerEmail: email,
+        participants: 1,
+        status: "active",
+        postedAt: new Date(),
+      };
+
+      const result = await eventsCollection.insertOne(eventData);
+
+      await joinedEventsCollection.insertOne({
+        eventId: result.insertedId.toString(),
+        eventName: req.body.eventName,
+        userEmail: email,
+        userName: user.name || user.displayName,
+        amount:
+          user.role === "admin"
+            ? 0
+            : Number(req.body.organizerContribution || 0),
+        transactionId: "organizer_auto_join",
+        joinedDate: new Date(),
+      });
+
+      res.send(result);
+    });
+
+    // ৫. ইভেন্ট আপডেট করা
+    app.patch("/api/events/:id", verifyToken, async (req, res) => {
+      try {
+        const id = req.params.id;
+        const userEmail = req.decoded.email;
+        const userRole = req.decoded.role;
+
+        const filter = { _id: new ObjectId(id) };
+
+        let query = filter;
+        if (userRole !== "admin") {
+          query = {
+            _id: new ObjectId(id),
+            organizerEmail: userEmail,
+          };
+        }
+
+        const updateData = { ...req.body };
+        delete updateData._id;
+
+        const updatedDoc = { $set: updateData };
+        const result = await eventsCollection.updateOne(query, updatedDoc);
+
+        if (result.matchedCount === 0) {
+          return res.status(403).send({
+            message: "আপনি এই ইভেন্টটি আপডেট করার অনুমতিপ্রাপ্ত নন!",
+          });
+        }
+
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "সার্ভার এরর!" });
+      }
+    });
+
+    // ৬. ইভেন্ট ডিলিট করা (অ্যাডমিন এবং অর্গানাইজার উভয়ই পারবে)
+    app.delete("/api/events/:id", verifyToken, async (req, res) => {
+      const id = req.params.id;
+      const email = req.decoded.email;
+      const user = await usersCollection.findOne({ email });
+
+      let query = { _id: new ObjectId(id) };
+      if (user?.role !== "admin") {
+        query.organizerEmail = email;
+      }
+
+      const result = await eventsCollection.deleteOne(query);
+      res.send(result);
+    });
+
+    /* =======================
+        JOIN EVENT API
+    ======================= */
+    app.post("/api/join-event", verifyToken, async (req, res) => {
+      const { eventId, eventName, amount, transactionId } = req.body;
+      const email = req.decoded.email;
+
+      const alreadyJoined = await joinedEventsCollection.findOne({
+        userEmail: email,
+        eventId: eventId,
+      });
+
+      if (alreadyJoined)
+        return res.status(400).send({ message: "Already joined" });
+
+      const user = await usersCollection.findOne({ email });
+      const joinDoc = {
+        eventId,
+        eventName,
+        userEmail: email,
+        userName: user?.name || user?.displayName || "User",
+        amount: Number(amount),
+        transactionId,
+        joinedDate: new Date(),
+      };
+
+      const result = await joinedEventsCollection.insertOne(joinDoc);
+      await eventsCollection.updateOne(
+        { _id: new ObjectId(eventId) },
+        { $inc: { participants: 1 } },
+      );
+      res.send(result);
+    });
+
+    app.get("/api/joined-events/:email", verifyToken, async (req, res) => {
+      const email = req.params.email;
+      if (email !== req.decoded.email)
+        return res.status(403).send({ message: "Forbidden" });
+
+      try {
+        const userJoins = await joinedEventsCollection
+          .find({ userEmail: email })
+          .toArray();
+        const eventIds = userJoins.map((item) => new ObjectId(item.eventId));
+        const eventDetails = await eventsCollection
+          .find({ _id: { $in: eventIds } })
+          .toArray();
+
+        const result = userJoins.map((join) => {
+          const detail = eventDetails.find(
+            (d) => d._id.toString() === join.eventId,
+          );
+          return {
+            ...join,
+            ...detail,
+            _id: join._id,
+            eventMainId: detail?._id,
+          };
+        });
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Error fetching joined events" });
+      }
+    });
+    app.get("/api/recent-joins", verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const result = await joinedEventsCollection
+          .find()
+          .sort({ joinedDate: -1 })
+          .limit(5)
+          .toArray();
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "Error fetching recent joins" });
+      }
+    });
+    app.get(
+      "/api/all-joined-events",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const result = await joinedEventsCollection
+            .find()
+            .sort({ joinedDate: -1 })
+            .toArray();
+          res.send(result);
+        } catch (error) {
+          res.status(500).send({ message: "ডেটা আনতে সমস্যা হয়েছে।" });
+        }
+      },
+    );
+    /* =======================
+        ADMIN STATS
+    ======================= */
+    app.get("/api/admin-stats", verifyToken, verifyAdmin, async (req, res) => {
       const totalEvents = await eventsCollection.countDocuments();
       const totalUsers = await usersCollection.countDocuments();
-
-      const stats = await joinedEventsCollection
-        .aggregate([
-          {
-            $match: {
-              joinedDate: { $gte: dateLimit.toISOString() },
-            },
-          },
-          {
-            $group: {
-              _id: null,
-              totalEarnings: { $sum: "$amount" },
-              totalJoined: { $sum: 1 },
-            },
-          },
-        ])
+      const totalJoined = await joinedEventsCollection.countDocuments();
+      const revenue = await joinedEventsCollection
+        .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
         .toArray();
 
-      const chartData = await joinedEventsCollection
+      const categoryStats = await eventsCollection
         .aggregate([
-          {
-            $match: {
-              joinedDate: { $gte: dateLimit.toISOString() },
-            },
-          },
-          {
-            $group: {
-              _id: { $substr: ["$joinedDate", 0, 10] },
-              amount: { $sum: "$amount" },
-            },
-          },
-          { $sort: { _id: 1 } },
-          { $project: { name: "$_id", amount: 1, _id: 0 } },
+          { $group: { _id: "$category", value: { $sum: 1 } } },
+          { $project: { name: "$_id", value: 1, _id: 0 } },
         ])
         .toArray();
 
       res.send({
         totalEvents,
         totalUsers,
-        totalEarnings: stats[0]?.totalEarnings || 0,
-        totalJoined: stats[0]?.totalJoined || 0,
-        chartData,
+        totalJoined,
+        totalEarnings: revenue[0]?.total || 0,
+        categoryData: categoryStats,
       });
     });
 
-    // Recent Joins
-    app.get("/api/recent-joins", async (req, res) => {
-      const joins = await joinedEventsCollection
-        .find()
-        .sort({ joinedDate: -1 })
-        .limit(10)
-        .toArray();
-
-      res.send(joins);
+    /* =======================
+        ADMIN Donation STATS
+    ======================= */
+    // ১. সকল ডোনেশন গেট করার এপিআই (Admin Only)
+    app.get("/api/donations", verifyToken, verifyAdmin, async (req, res) => {
+      try {
+        const result = await joinedEventsCollection
+          .find()
+          .sort({ joinedDate: -1 })
+          .toArray();
+        res.send(result);
+      } catch (error) {
+        res.status(500).send({ message: "ডোনেশন ডাটা আনতে সমস্যা হয়েছে।" });
+      }
     });
 
-    console.log("✅ MongoDB Connected Successfully");
-  } catch (error) {
-    console.error(error);
+    // ২. ডোনেশন স্ট্যাটাস আপডেট করার এপিআই (Pending to Success)
+    app.patch(
+      "/api/donations/:id",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const id = req.params.id;
+          const filter = { _id: new ObjectId(id) };
+          const updatedDoc = {
+            $set: {
+              status: req.body.status, // যেমন: "Success" বা "Verified"
+            },
+          };
+          const result = await joinedEventsCollection.updateOne(
+            filter,
+            updatedDoc,
+          );
+          res.send(result);
+        } catch (error) {
+          res.status(500).send({ message: "স্ট্যাটাস আপডেট ব্যর্থ হয়েছে।" });
+        }
+      },
+    );
+    // ৩. কোনো ডোনেশন রেকর্ড ডিলিট করার এপিআই
+    app.delete(
+      "/api/donations/:id",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        try {
+          const id = req.params.id;
+          const query = { _id: new ObjectId(id) };
+          const result = await joinedEventsCollection.deleteOne(query);
+          res.send(result);
+        } catch (error) {
+          res.status(500).send({ message: "রেকর্ড ডিলিট করা যায়নি।" });
+        }
+      },
+    );
+    console.log("💎 MongoDB Connected Successfully!");
+  } finally {
   }
 }
+run().catch(console.dir);
 
-run();
-
-app.get("/", (req, res) => {
-  res.send("Social Development Events Server Running 🚀");
-});
-
-app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
-});
+app.get("/", (req, res) => res.send("SDEP Server is running..."));
+app.listen(port, () => console.log(`Server is on port ${port}`));
